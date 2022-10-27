@@ -6,25 +6,27 @@ import "@openzeppelin/contracts/token/ERC20/extensions/ERC20Capped.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
 // import "./Swaper.sol";
 
-
 interface Swaper {
     function swapInTokenToOutToken(uint256 amountIn, address _in, address _out) external returns (uint256 amountOut);
     function balanceForToken(address _tokenAddress) external view returns (uint256);
     function transferToken(address recipient, uint256 amount, address _tokenAddress) external returns(bool);
     function transferEth(address _to, uint256 _amount) external;
+    function unwrapEth(address payable _wrapper, uint256 _amount) external payable;
 }
 
-contract PolyToken is ERC20Capped, Ownable{
+contract Funger is ERC20Capped, Ownable{
 
+    bool public entrance;
     uint public sentValue;
     uint public immutable _decimals = 0;
     uint public minimumContribution; // This is also the token price (goal_ / cap_)
     address public admin;
     uint public deadline; // Timestamp
     uint public goal;
+    uint public _cap;
     address public immutable wethContract = 0xB4FBF271143F4FBf7B91A5ded31805e42b2208d6;
 
-    mapping(address => uint) public contributors;
+    mapping(address => uint256) public contributors;
     uint public noOfContributors;
     uint public raisedAmount;
     struct Request{
@@ -34,8 +36,11 @@ contract PolyToken is ERC20Capped, Ownable{
         address inToken;
         address outToken;
         bool completed;
-        uint noOfVoters;
-        mapping(address => bool) voters;
+        uint noOfApprovalVoters;
+        bool terminate;
+        uint noOfTerminationVoters;
+        mapping(address => bool) approvalVoters;
+        mapping(address => bool) terminationVoters;
     }
 
     mapping(uint => Request) public requests;
@@ -45,16 +50,19 @@ contract PolyToken is ERC20Capped, Ownable{
     constructor(
         string memory name_, 
         string memory symbol_, 
-        uint256 cap_, // Max Supply
+        uint cap_, // Max Supply
         uint goal_ // Amount in eth
         // uint deadline_ // Time in seconds after which no more tokens can be bought
         ) 
         ERC20(name_, symbol_) ERC20Capped(cap_){
             minimumContribution = goal_/cap_;
+            _cap = cap_;
             goal = goal_; // Could be replaced for max supply
             // deadline = block.timestamp + deadline_;
             // minimumContribution = _minimumContribution; // This could be the price of the unit of the token
             admin = msg.sender;
+            entrance = true;
+
     }
 ///////////////////////////////////////////////////////////////////////////////////////////
     // Holders of the the minted token can run the function
@@ -83,7 +91,11 @@ contract PolyToken is ERC20Capped, Ownable{
     fallback() external payable {}
 
     receive() external payable{
-        issueToken();
+        if (entrance == true) {
+            issueToken();
+        }else {
+            raisedAmount += msg.value;
+        }
     }
 
     // Calling functions from Swaper
@@ -108,8 +120,17 @@ contract PolyToken is ERC20Capped, Ownable{
         Swaper(_swaperAddr).transferEth(_to, _amount);
     }
 
+    function unwrap(address _swaperAddr, uint256 _amount) public payable {
+        address payable _to = payable(wethContract);
+        Swaper(_swaperAddr).unwrapEth(_to, _amount);
+    }
+
 //////////////////////////////////////////////////////////////////////////////////
     // Functions from DAO
+    function setEntrance() public {
+        entrance = !entrance;
+    }
+
     function getBalance() public view returns(uint){
         return address(this).balance;
     }
@@ -124,7 +145,9 @@ contract PolyToken is ERC20Capped, Ownable{
         newRequest.inToken = _inToken;
         newRequest.outToken = _outToken;
         newRequest.completed = false;
-        newRequest.noOfVoters = 0;
+        newRequest.terminate = false;
+        newRequest.noOfApprovalVoters = 0;
+        newRequest.noOfTerminationVoters = 0;
 
         emit CreateRequestEvent(_description, _swapContract, _value, _inToken, _outToken);
     }
@@ -133,9 +156,9 @@ contract PolyToken is ERC20Capped, Ownable{
         Request storage thisRequest = requests[_requestNo];
         require(thisRequest.value > 0, "This request has not been created");
         require(thisRequest.completed == false, "The request is closed");
-        require(thisRequest.voters[msg.sender] == false, "You have already voted!");
-        thisRequest.voters[msg.sender] = true;
-        thisRequest.noOfVoters++;
+        require(thisRequest.approvalVoters[msg.sender] == false, "You have already voted!");
+        thisRequest.approvalVoters[msg.sender] = true;
+        thisRequest.noOfApprovalVoters++;
     }
 
     function cancelRequest(uint _requestNo) public onlyAdmin {
@@ -148,7 +171,7 @@ contract PolyToken is ERC20Capped, Ownable{
         require(raisedAmount >= goal, "The contract has not raised the goal amount");
         Request storage thisRequest = requests[_requestNo];
         require(thisRequest.completed == false, "The request has been completed!");
-        require(thisRequest.noOfVoters > noOfContributors / 2, "More than 50% of approvals required"); // 50% voted for this request
+        require(thisRequest.noOfApprovalVoters > noOfContributors / 2, "More than 50% of approvals required"); // 50% voted for this request
 
         // First we send eth to the Swaper contract
         transferEth(thisRequest.swapContract, thisRequest.value);
@@ -169,10 +192,44 @@ contract PolyToken is ERC20Capped, Ownable{
         // swap(address _swaperAddr, uint256 _amount, address _in, address _out);
     }
 
+    // Voting to terminate
+    function voteTermination(uint _requestNo) public onlyHolder{
+        Request storage thisRequest = requests[_requestNo];
+        require(thisRequest.value > 0, "This request has not been created");
+        require(thisRequest.completed == true, "There is nothing to terminate");
+        require(thisRequest.terminationVoters[msg.sender] == false, "You have already voted!");
+        thisRequest.terminationVoters[msg.sender] = true;
+        thisRequest.noOfTerminationVoters++;
+    }
+
+    // Make liquidity. This function converts the token from a completed request back to 
+    // WETH then to ETH and then transfers it back to the Funger contract
+    function terminateInvestment(uint _requestNo) public payable {
+        Request storage thisRequest = requests[_requestNo];
+        require(thisRequest.completed == true, "The request must be completed to proceed!");
+        require(thisRequest.terminate == false, "The request has already been terminated!");
+        require(thisRequest.noOfTerminationVoters > noOfContributors / 2, "More than 50% of approvals required"); // more than 50% voted for this request
+        
+        // We convert the ERC20 back to WETH
+        uint256 tokenValue = swaperBalanceForToken(thisRequest.swapContract, thisRequest.outToken);
+        swap(thisRequest.swapContract, tokenValue, thisRequest.outToken, thisRequest.inToken);
+
+        // Next we unwrap the WETH
+        uint256 wethValue = swaperBalanceForToken(thisRequest.swapContract, thisRequest.inToken);
+        unwrap(thisRequest.swapContract, wethValue);
+
+        // The ETH is transfered back to the Funger Contract
+        swapTransferEth(thisRequest.swapContract, payable(address(this)), address(thisRequest.swapContract).balance);
+        
+        // We update the status of the request
+        thisRequest.terminate = true;
+
+    }
+
     // Tokens will be minted and transfered to the account that deposits eth
     function issueToken() public payable {
         // require(block.timestamp < deadline, "Deadline has passed");
-
+        // require(entrance == false);
         // Making sure that the sent amount is a multiple of the price of the unit
         // token (minimumContribution)
         require(msg.value % minimumContribution == 0, 
@@ -193,6 +250,13 @@ contract PolyToken is ERC20Capped, Ownable{
         raisedAmount += msg.value;
 
         emit ContributeEvent(msg.sender, msg.value);
+    }
+
+    function burnTokens(address payable _member) public onlyAdmin returns (uint256){
+        uint256 receipt = (balanceOf(_member) * _cap) / address(this).balance;
+        transferEth(_member, receipt);
+        _burn(_member, balanceOf(_member));
+        return (receipt);
     }
 
     function transferEth(address payable _to, uint256 _amount) public payable {
